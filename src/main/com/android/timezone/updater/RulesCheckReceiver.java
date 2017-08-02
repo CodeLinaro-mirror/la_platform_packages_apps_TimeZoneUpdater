@@ -24,6 +24,9 @@ import android.app.timezone.RulesUpdaterContract;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ApplicationInfo;
+import android.content.pm.PackageManager;
+import android.content.pm.ProviderInfo;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.ParcelFileDescriptor;
@@ -54,14 +57,14 @@ import libcore.io.Streams;
  * The data app makes its payload available via a {@link TimeZoneRulesDataContract specified}
  * {@link android.content.ContentProvider} with the URI {@link TimeZoneRulesDataContract#AUTHORITY}.
  *
- * <p>If the {@link TimeZoneRulesDataContract.Operation#TYPE operation type} is an
+ * <p>If the {@link TimeZoneRulesDataContract.Operation#COLUMN_TYPE operation type} is an
  * {@link TimeZoneRulesDataContract.Operation#TYPE_INSTALL install request}, then the time zone data
- * format {@link TimeZoneRulesDataContract.Operation#DISTRO_MAJOR_VERSION major version} and
- * {@link TimeZoneRulesDataContract.Operation#DISTRO_MINOR_VERSION minor version}, the
- * {@link TimeZoneRulesDataContract.Operation#RULES_VERSION IANA rules version}, and the
- * {@link TimeZoneRulesDataContract.Operation#REVISION revision} are checked to see if they can be
- * applied to the device. If the data is valid the {@link RulesCheckReceiver} will obtain the
- * payload from the data app content provider via
+ * format {@link TimeZoneRulesDataContract.Operation#COLUMN_DISTRO_MAJOR_VERSION major version} and
+ * {@link TimeZoneRulesDataContract.Operation#COLUMN_DISTRO_MINOR_VERSION minor version}, the
+ * {@link TimeZoneRulesDataContract.Operation#COLUMN_RULES_VERSION IANA rules version}, and the
+ * {@link TimeZoneRulesDataContract.Operation#COLUMN_REVISION revision} are checked to see if they
+ * can be applied to the device. If the data is valid the {@link RulesCheckReceiver} will obtain
+ * the payload from the data app content provider via
  * {@link android.content.ContentProvider#openFile(Uri, String)} and pass the data to the system
  * server for installation via the
  * {@link RulesManager#requestInstall(ParcelFileDescriptor, byte[], Callback)}.
@@ -87,6 +90,14 @@ public class RulesCheckReceiver extends BroadcastReceiver {
         mRulesManager = (RulesManager) context.getSystemService("timezone");
 
         byte[] token = intent.getByteArrayExtra(RulesUpdaterContract.EXTRA_CHECK_TOKEN);
+
+        if (shouldUninstallCurrentInstall(context)) {
+            Log.i(TAG, "Device should be returned to having no time zone distro installed, issuing"
+                    + " uninstall request");
+            // Uninstall is a no-op if nothing is installed.
+            handleUninstall(token);
+            return;
+        }
 
         // Note: We rely on the system server to check that the configured data application is the
         // one that exposes the content provider with the well-known authority, and is a privileged
@@ -124,15 +135,40 @@ public class RulesCheckReceiver extends BroadcastReceiver {
         }
     }
 
+    private boolean shouldUninstallCurrentInstall(Context context) {
+        int flags = PackageManager.MATCH_DISABLED_UNTIL_USED_COMPONENTS;
+        PackageManager packageManager = context.getPackageManager();
+        ProviderInfo providerInfo =
+                packageManager.resolveContentProvider(TimeZoneRulesDataContract.AUTHORITY, flags);
+        if (providerInfo == null || providerInfo.applicationInfo == null) {
+            Log.w(TAG, "No package/application info available for content provider "
+                    + TimeZoneRulesDataContract.AUTHORITY);
+            // Something has gone wrong. Trying to return the device to clean is a reasonable
+            // response.
+            return true;
+        }
+
+        // If the data app is the one from /system, we can treat this as "uninstall": if nothing
+        // is installed then the system will treat this as a no-op, and if something is installed
+        // this will stage an uninstall.
+        // We could install the distro from an app contained in the system image but we assume it's
+        // going to contain the same time zone data as in /system and would be a no op.
+
+        ApplicationInfo applicationInfo = providerInfo.applicationInfo;
+        // isPrivilegedApp() => initial install directory for app /system/priv-app (required)
+        // isUpdatedSystemApp() => app has been replaced by an updated version that resides in /data
+        return applicationInfo.isPrivilegedApp() && !applicationInfo.isUpdatedSystemApp();
+    }
+
     private DistroOperation getOperation(Context context) {
         Cursor c = context.getContentResolver()
                 .query(TimeZoneRulesDataContract.Operation.CONTENT_URI,
                         new String[] {
-                                TimeZoneRulesDataContract.Operation.TYPE,
-                                TimeZoneRulesDataContract.Operation.DISTRO_MAJOR_VERSION,
-                                TimeZoneRulesDataContract.Operation.DISTRO_MINOR_VERSION,
-                                TimeZoneRulesDataContract.Operation.RULES_VERSION,
-                                TimeZoneRulesDataContract.Operation.REVISION
+                                TimeZoneRulesDataContract.Operation.COLUMN_TYPE,
+                                TimeZoneRulesDataContract.Operation.COLUMN_DISTRO_MAJOR_VERSION,
+                                TimeZoneRulesDataContract.Operation.COLUMN_DISTRO_MINOR_VERSION,
+                                TimeZoneRulesDataContract.Operation.COLUMN_RULES_VERSION,
+                                TimeZoneRulesDataContract.Operation.COLUMN_REVISION
                         },
                         null /* selection */, null /* selectionArgs */, null /* sortOrder */);
         try (Cursor cursor = c) {
@@ -199,13 +235,13 @@ public class RulesCheckReceiver extends BroadcastReceiver {
         ParcelFileDescriptor inputFileDescriptor;
         try {
             inputFileDescriptor = context.getContentResolver().openFileDescriptor(
-                    TimeZoneRulesDataContract.Data.CONTENT_URI, "r");
+                    TimeZoneRulesDataContract.Operation.CONTENT_URI, "r");
             if (inputFileDescriptor == null) {
                 throw new FileNotFoundException("ContentProvider returned null");
             }
         } catch (FileNotFoundException e) {
             Log.e(TAG, "Unable to open file descriptor"
-                    + TimeZoneRulesDataContract.Data.CONTENT_URI, e);
+                    + TimeZoneRulesDataContract.Operation.CONTENT_URI, e);
             return null;
         }
         return inputFileDescriptor;
